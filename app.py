@@ -1,60 +1,66 @@
 
 import streamlit as st
+from PIL import Image
 import numpy as np
 import cv2
-from skimage.morphology import skeletonize
-from PIL import Image
-import io
+from postprocess import postprocess_mask_from_probs
 
-st.set_page_config(page_title="Crack Analyzer - Public", layout="wide")
+st.set_page_config(page_title="Crack Analyzer (with postprocessing)", layout="wide")
 
-st.title("🔎 Crack Analyzer — Public (Render-ready)")
+st.title("Crack Analyzer — Demo (postprocessing enabled)")
+
 st.markdown("""
-This app is prepared for Render deployment.
-
-**Start command (Render):**
-`streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`
+This demo applies a classical crack-proposal detector (Canny-based) and then a post-processing step
+to remove tiny/noisy detections. If you have a custom segmentation model file named `best_resnet18.pth`
+in the repo, the app can be extended to load it (not included by default).
 """)
 
-col1, col2 = st.columns([1,1])
-with col1:
-    uploaded = st.file_uploader("Upload image (jpg/png)", type=["jpg","jpeg","png"])
-    px2mm = st.number_input("Scale (mm/pixel)", value=0.1, format="%.4f")
-with col2:
-    st.write("Tips:")
-    st.write("- Take images perpendicular to the surface and include a ruler if possible.")
-    st.write("- Avoid strong reflections; they can confuse detection.")
+uploaded = st.file_uploader("Upload an image (jpg/png)", type=["jpg","jpeg","png"])
 
-def classical_crack_mask(img_bgr):
-    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    g = cv2.equalizeHist(g)
-    g = cv2.GaussianBlur(g, (5,5), 0)
-    tophat = cv2.morphologyEx(g, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT,(15,15)))
-    edges = cv2.Canny(tophat, 50, 150)
-    edges = cv2.dilate(edges, None, iterations=1)
-    edges = cv2.erode(edges, None, iterations=1)
-    return edges
+def classical_detector(img_pil):
+    # returns probability-like map (float 0..1)
+    img = np.array(img_pil.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    # CLAHE to normalize illumination
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(gray)
+    # slight blur
+    g = cv2.GaussianBlur(g, (3,3), 0)
+    # Canny edges
+    edges = cv2.Canny(g, 50, 150)
+    # Dilate to make edges thicker
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    edges = cv2.dilate(edges, k, iterations=1)
+    # Normalize to 0..1 float map
+    prob = edges.astype("float32")/255.0
+    # Smooth a bit
+    prob = cv2.GaussianBlur(prob, (5,5), 1.0)
+    return prob
 
-if uploaded is not None:
-    data = uploaded.read()
-    arr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        st.error("Could not read image. Try another file.")
-    else:
-        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Original", use_column_width=True)
-        mask = classical_crack_mask(img)
-        skel = skeletonize(mask>0)
-        px_length = int(skel.sum())
-        length_mm = px_length * px2mm
-        st.write(f"Total crack length (approx): **{length_mm:.2f} mm**")
-        overlay = img.copy()
-        overlay[skel] = (0,0,255)
-        st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), caption="Cracks (red)", use_column_width=True)
-        # download mask
-        mask_png = (mask>0).astype('uint8')*255
-        success, buf = cv2.imencode('.png', mask_png)
-        if success:
-            st.download_button("Download mask (PNG)", data=buf.tobytes(), file_name="mask.png", mime="image/png")
-        else:
-            st.error("Mask creation failed.")
+def overlay_mask(img_pil, mask, alpha=0.6, color=(255,0,0)):
+    img = np.array(img_pil.convert("RGB")).astype("uint8")
+    mask3 = np.zeros_like(img)
+    mask_bool = (mask>127)
+    mask3[mask_bool] = color
+    out = img.copy()
+    out = cv2.addWeighted(out, 1.0, mask3, alpha, 0)
+    return Image.fromarray(out)
+
+if uploaded:
+    img = Image.open(uploaded)
+    st.image(img, caption="Uploaded image", use_column_width=True)
+    with st.spinner("Running classical detector..."):
+        prob_map = classical_detector(img)
+    st.write("Probability / edge map (classical detector)")
+    # show prob map
+    st.image((prob_map*255).astype("uint8"), width=350)
+    st.write("Applying post-processing to remove small/noisy detections...")
+    # postprocess
+    pp_mask = postprocess_mask_from_probs(prob_map, thresh=0.65, gaussian_ksize=5, min_area=500, min_len=40, min_w=3)
+    st.write("Post-processed mask (binary)")
+    st.image(pp_mask, width=350)
+    st.write("Overlayed result")
+    st.image(overlay_mask(img, pp_mask), use_column_width=True)
+    st.success("Done — tweak parameters in postprocess.py if you want different sensitivity.")
+else:
+    st.info("Upload an image to run detection.")

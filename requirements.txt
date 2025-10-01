@@ -1,5 +1,5 @@
 streamlit
-opencv-python-headless
-scikit-image
 numpy
 pillow
+opencv-python-headless
+scikit-image
