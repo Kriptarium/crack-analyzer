@@ -1,9 +1,7 @@
-
 import numpy as np
 import cv2
 from skimage.morphology import skeletonize
 from skimage.measure import label, regionprops
-from PIL import Image
 
 def remove_small_components(mask, min_area=500):
     lbl = label(mask>0)
@@ -12,6 +10,20 @@ def remove_small_components(mask, min_area=500):
         if r.area >= min_area:
             out[lbl==r.label] = 255
     return out
+
+def prune_skeleton_spurs(mask, iterations=8):
+    binm = (mask>0).astype('uint8')
+    sk = skeletonize(binm).astype('uint8')
+    K = np.ones((3,3), dtype=np.uint8); K[1,1]=0
+    sk_work = sk.copy()
+    for _ in range(iterations):
+        nb = cv2.filter2D(sk_work.astype(np.uint8), -1, K, borderType=cv2.BORDER_CONSTANT)
+        endpoints = ((sk_work==1) & (nb==1)).astype(np.uint8)
+        if endpoints.sum() == 0:
+            break
+        sk_work[endpoints==1] = 0
+    sk_dil = cv2.dilate(sk_work.astype('uint8'), cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), iterations=1)
+    return (sk_dil*255).astype('uint8')
 
 def filter_by_skeleton_length(mask, min_skel_len=40):
     out = np.zeros_like(mask)
@@ -38,22 +50,8 @@ def filter_by_elongation(mask, min_elongation=3.0):
             out[lbl==r.label] = 255
     return out
 
-def prune_skeleton_spurs(mask, iterations=8):
-    binm = (mask>0).astype('uint8')
-    sk = skeletonize(binm).astype('uint8')
-    K = np.ones((3,3), dtype=np.uint8); K[1,1]=0
-    sk_work = sk.copy()
-    for _ in range(iterations):
-        nb = cv2.filter2D(sk_work.astype(np.uint8), -1, K, borderType=cv2.BORDER_CONSTANT)
-        endpoints = ((sk_work==1) & (nb==1)).astype(np.uint8)
-        if endpoints.sum() == 0:
-            break
-        sk_work[endpoints==1] = 0
-    sk_dil = cv2.dilate(sk_work.astype('uint8'), cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), iterations=1)
-    return (sk_dil*255).astype('uint8')
-
 def improved_postprocess_from_probs(probs,
-                                   thresh=0.7,
+                                   thresh=0.65,
                                    gaussian_ksize=5,
                                    min_area=500,
                                    min_skel_len=60,
