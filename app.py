@@ -1,118 +1,138 @@
-import os, io, time, sys
+
 import streamlit as st
-from PIL import Image
 import numpy as np
-import torch
-from torchvision import models, transforms
-from postprocess_improved import improved_postprocess_from_probs
-import tempfile
+from PIL import Image
+import io, os, torch, onnx, onnxruntime as ort
+import cv2
+from utils import (
+    read_image_as_rgb, 
+    preprocess_for_classification, 
+    preprocess_for_segmentation, 
+    overlay_mask, 
+    safe_torch_load_state_dict,
+    canny_baseline
+)
+from models import SimpleCrackClassifier, UNetLite
 
-st.set_page_config(page_title="Crack Analyzer (Model Demo + Report)", layout="wide")
-st.title("Crack Analyzer — Demo + Report generator")
+st.set_page_config(page_title="Crack Analyzer – File Runner", page_icon="🧱", layout="wide")
 
-st.sidebar.header("Model settings")
-MODEL_PATH = "best_crack500.pth"
-MODEL_URL = os.getenv("MODEL_URL","").strip()
-device = torch.device("mps") if torch.backends.mps.is_available() else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-st.sidebar.write("Device: %s" % device)
+st.title("🧱 Crack Analyzer – File Runner")
+st.caption("Tek dosya çalıştırma arayüzü: model yükle, görsel seç, çalıştır. Kaggle Crack500 veya benzeri çatlak görüntüleri için.")
 
-@st.cache_resource(show_spinner=False)
-def download_model_if_needed(url, dst="best_crack500.pth"):
-    if os.path.exists(dst):
-        return dst
-    if not url:
-        return None
-    import subprocess
-    st.sidebar.write("Downloading model...")
-    try:
-        subprocess.check_call(["curl","-L",url,"-o",dst])
-        return dst
-    except Exception as e:
-        st.sidebar.error("Model download failed: %s" % str(e))
-        return None
+with st.sidebar:
+    st.header("Ayarlar")
+    mode = st.selectbox("Çalışma modu", ["Baseline (Canny)", "PyTorch: Sınıflandırma", "PyTorch: Segmentasyon", "ONNX: Sınıflandırma", "ONNX: Segmentasyon"])
+    conf_threshold = st.slider("Mask eşik değeri (seg.)", 0.1, 0.9, 0.5, 0.05)
+    show_overlay = st.checkbox("Maskeyi görüntü üzerine bindir", True)
+    show_heatmap = st.checkbox("Isı haritası (seg.)", False)
 
-@st.cache_resource
-def load_model(path):
-    if path is None or not os.path.exists(path):
-        return None
-    model = models.segmentation.deeplabv3_resnet50(pretrained=False)
-    model.classifier[4] = torch.nn.Conv2d(256,1,kernel_size=1)
-    model.aux_classifier = None
-    ck = torch.load(path, map_location=device)
-    sd = ck.get("model_state", ck) if isinstance(ck, dict) else ck
-    model.load_state_dict(sd)
-    model.to(device).eval()
-    return model
+st.write("### 1) Görsel yükle")
+img_file = st.file_uploader("Görsel dosyası yükleyin (JPG/PNG).", type=["jpg","jpeg","png"])
 
-model_file = download_model_if_needed(MODEL_URL, MODEL_PATH) if MODEL_URL else (MODEL_PATH if os.path.exists(MODEL_PATH) else None)
-if model_file:
-    st.sidebar.success("Model available: %s" % os.path.basename(model_file))
-else:
-    st.sidebar.warning("No model found. Set MODEL_URL env var or upload best_crack500.pth to repo root. App will run classical detector fallback.")
+st.write("### 2) Model (isteğe bağlı) yükle")
+model_file = st.file_uploader("Model dosyası yükleyin (.pth veya .onnx). Seçili moda uygun olmalı.", type=["pth","onnx"])
 
-model = load_model(model_file) if model_file else None
+col1, col2 = st.columns([1,1])
 
-st.sidebar.header("Postprocess sliders (for demo)")
-thresh = st.sidebar.slider("Prob threshold", 0.5, 0.95, 0.65, 0.01)
-min_area = st.sidebar.slider("Min area (px)", 50, 5000, 700, 50)
-min_skel = st.sidebar.slider("Min skeleton length", 10, 300, 60, 5)
-min_elong = st.sidebar.slider("Min elongation", 1.0, 10.0, 3.0, 0.1)
-spur_iters = st.sidebar.slider("Prune spur iters", 0, 30, 8, 1)
-
-st.markdown("Upload an image to run model inference. If model isn't available, app runs a classical edge-based detector as fallback.")
-
-uploaded = st.file_uploader("Upload image", type=["jpg","jpeg","png"])
-def classical_detector(img_pil):
-    import cv2
-    arr = np.array(img_pil.convert("RGB"))
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    g = clahe.apply(gray)
-    g = cv2.GaussianBlur(g, (5,5), 0)
-    edges = cv2.Canny(g, 50, 150)
-    prob = edges.astype("float32")/255.0
-    prob = cv2.GaussianBlur(prob, (5,5), 1.0)
-    return prob
-
-def infer_with_model(img_pil):
-    tf = transforms.Compose([transforms.Resize((512,512)), transforms.ToTensor(),
-                             transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
-    x = tf(img_pil).unsqueeze(0).to(device)
-    with torch.no_grad():
-        out = model(x)['out']
-        prob = torch.sigmoid(out).cpu().numpy()[0,0]
-    return prob
-
-def overlay_mask(img_pil, mask, color=(255,0,0), alpha=0.6):
-    img = np.array(img_pil.convert("RGB")).astype("uint8")
-    mask3 = np.zeros_like(img)
-    mask_bool = (mask>127)
-    mask3[mask_bool] = color
-    out = cv2.addWeighted(img,1.0,mask3,alpha,0)
-    return Image.fromarray(out)
-
-if uploaded:
-    img = Image.open(uploaded).convert("RGB")
-    st.subheader("Original")
-    st.image(img, use_column_width=True)
-    if model is not None:
-        prob_map = infer_with_model(img)
+with col1:
+    st.subheader("Girdi")
+    if img_file:
+        image = read_image_as_rgb(img_file)
+        st.image(image, caption="Yüklenen görüntü", use_column_width=True)
     else:
-        prob_map = classical_detector(img)
-    st.subheader("Probability / edge map")
-    st.image((prob_map*255).astype("uint8"), width=420)
-    mask = improved_postprocess_from_probs(prob_map, thresh=thresh, gaussian_ksize=5,
-                                          min_area=min_area, min_skel_len=min_skel,
-                                          min_elongation=min_elong, spur_prune_iters=spur_iters)
-    st.subheader("Post-processed mask")
-    st.image(mask, width=420)
-    st.subheader("Overlay")
-    # overlay using cv2 (import lazily)
-    import cv2
-    ov = overlay_mask(img, mask)
-    st.image(ov, use_column_width=True)
+        st.info("Bir görüntü seçin. Eğer seçmezseniz demo için örnek bir taş dokusu kullanılacak.")
+        demo = Image.new("RGB", (512, 512), (210, 210, 210))
+        st.image(demo, caption="Demo görüntü", use_column_width=True)
+        image = demo
 
-st.markdown("---")
-st.markdown("## Report generation (offline)")
-st.markdown("To generate a full validation & performance report on a test split, run the included `generate_report.py` locally (or on a server). The report will compute IoU, Precision/Recall, save example FP/FN images and produce a Markdown report.")
-st.markdown("See README for exact commands.")
+run = st.button("▶️ Çalıştır")
+
+with col2:
+    st.subheader("Çıktı")
+
+    if run:
+        if mode == "Baseline (Canny)":
+            mask, vis = canny_baseline(np.array(image))
+            st.write("**Basit Canny tabanlı çatlak çıkarımı**")
+            st.image(vis, caption="Canny + morfoloji sonucu", use_column_width=True)
+
+        elif mode == "PyTorch: Sınıflandırma":
+            # Basit CNN ve .pth state_dict
+            model = SimpleCrackClassifier(num_classes=2)
+            if model_file and model_file.name.endswith(".pth"):
+                loaded = safe_torch_load_state_dict(model, model_file)
+                if not loaded:
+                    st.warning("Model state_dict yüklenemedi. Random ağırlıklarla devam ediliyor.")
+            else:
+                st.info(".pth dosyası yüklemediğiniz için model rastgele ağırlıklarla çalışacak (sadece demo).")
+
+            model.eval()
+            x = preprocess_for_classification(image)  # (1,3,H,W) tensor
+            with torch.no_grad():
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1).cpu().numpy().squeeze()
+            pred = int(probs.argmax())
+            labels = ["No Crack", "Crack"]
+            st.metric("Tahmin", labels[pred], delta=f"{probs[pred]*100:.1f}% güven")
+
+        elif mode == "PyTorch: Segmentasyon":
+            net = UNetLite(in_ch=3, out_ch=1)
+            if model_file and model_file.name.endswith(".pth"):
+                loaded = safe_torch_load_state_dict(net, model_file)
+                if not loaded:
+                    st.warning("UNet state_dict yüklenemedi. Random ağırlıklarla devam ediliyor (sadece demo).")
+            else:
+                st.info(".pth dosyası yüklenmedi; ağ rastgele ağırlıklarla (sadece demo).")
+
+            net.eval()
+            x, orig = preprocess_for_segmentation(image) # torch tensor, original np
+            with torch.no_grad():
+                pred = net(x)  # (1,1,h,w)
+                prob = torch.sigmoid(pred).cpu().numpy()[0,0]
+            mask = (prob >= conf_threshold).astype(np.uint8)*255
+            if show_heatmap:
+                heat = (prob * 255).astype(np.uint8)
+                st.image(heat, caption="Olasılık haritası (0-255)", use_column_width=True)
+            if show_overlay:
+                over = overlay_mask(orig, mask)
+                st.image(over, caption="Mask Overlay", use_column_width=True)
+            else:
+                st.image(mask, caption="İkili Maske", use_column_width=True)
+
+        elif mode == "ONNX: Sınıflandırma":
+            if not (model_file and model_file.name.endswith(".onnx")):
+                st.error("Lütfen ONNX sınıflandırma modeli yükleyin (.onnx).")
+            else:
+                ort_sess = ort.InferenceSession(model_file.getvalue(), providers=['CPUExecutionProvider'])
+                x = preprocess_for_classification(image, as_numpy=True)  # np array (1,3,H,W)
+                inp = ort_sess.get_inputs()[0].name
+                out = ort_sess.get_outputs()[0].name
+                logits = ort_sess.run([out], {inp: x})[0]  # (1,2)
+                probs = (logits - logits.max()).astype(np.float32)
+                probs = np.exp(probs) / np.exp(probs).sum(axis=1, keepdims=True)
+                pred = int(probs.argmax())
+                labels = ["No Crack", "Crack"]
+                st.metric("Tahmin", labels[pred], delta=f"{probs[0,pred]*100:.1f}% güven")
+
+        elif mode == "ONNX: Segmentasyon":
+            if not (model_file and model_file.name.endswith(".onnx")):
+                st.error("Lütfen ONNX segmentasyon modeli yükleyin (.onnx).")
+            else:
+                ort_sess = ort.InferenceSession(model_file.getvalue(), providers=['CPUExecutionProvider'])
+                x, orig = preprocess_for_segmentation(image, as_numpy=True)  # np (1,3,h,w), orig np
+                inp = ort_sess.get_inputs()[0].name
+                out = ort_sess.get_outputs()[0].name
+                logits = ort_sess.run([out], {inp: x})[0]  # (1,1,h,w)
+                prob = 1/(1+np.exp(-logits[0,0]))
+                mask = (prob >= conf_threshold).astype(np.uint8)*255
+                if show_heatmap:
+                    heat = (prob * 255).astype(np.uint8)
+                    st.image(heat, caption="Olasılık haritası (0-255)", use_column_width=True)
+                if show_overlay:
+                    over = overlay_mask(orig, mask)
+                    st.image(over, caption="Mask Overlay", use_column_width=True)
+                else:
+                    st.image(mask, caption="İkili Maske", use_column_width=True)
+
+    else:
+        st.info("Sol taraftan modu seçin, görüntünüzü ve (varsa) model dosyanızı yükleyin, sonra **Çalıştır** butonuna basın.")
