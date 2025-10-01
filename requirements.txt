@@ -5,6 +5,4 @@ numpy
 pillow
 opencv-python-headless
 scikit-image
-scikit-learn
 matplotlib
-albumentations
