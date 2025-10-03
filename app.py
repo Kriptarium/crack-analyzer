@@ -1,138 +1,72 @@
 
 import streamlit as st
-import numpy as np
 from PIL import Image
-import io, os, torch, onnx, onnxruntime as ort
+import numpy as np
 import cv2
-from utils import (
-    read_image_as_rgb, 
-    preprocess_for_classification, 
-    preprocess_for_segmentation, 
-    overlay_mask, 
-    safe_torch_load_state_dict,
-    canny_baseline
-)
-from models import SimpleCrackClassifier, UNetLite
+from postprocess_improved import improved_postprocess_from_probs
 
-st.set_page_config(page_title="Crack Analyzer – File Runner", page_icon="🧱", layout="wide")
+st.set_page_config(page_title="Crack Analyzer (postprocess adjustable)", layout="wide")
 
-st.title("🧱 Crack Analyzer – File Runner")
-st.caption("Tek dosya çalıştırma arayüzü: model yükle, görsel seç, çalıştır. Kaggle Crack500 veya benzeri çatlak görüntüleri için.")
+st.title("Crack Analyzer — Demo (improved postprocessing)")
+st.markdown("Upload an image. The app runs a classical edge-based detector and then applies an improved postprocessing chain. Use the sidebar to tune sensitivity.")
 
-with st.sidebar:
-    st.header("Ayarlar")
-    mode = st.selectbox("Çalışma modu", ["Baseline (Canny)", "PyTorch: Sınıflandırma", "PyTorch: Segmentasyon", "ONNX: Sınıflandırma", "ONNX: Segmentasyon"])
-    conf_threshold = st.slider("Mask eşik değeri (seg.)", 0.1, 0.9, 0.5, 0.05)
-    show_overlay = st.checkbox("Maskeyi görüntü üzerine bindir", True)
-    show_heatmap = st.checkbox("Isı haritası (seg.)", False)
+# Sidebar sliders for live parameter tuning
+st.sidebar.header("Postprocess parameters (tweak & test)")
+thresh = st.sidebar.slider("Probability threshold", 0.5, 0.95, 0.70, 0.01)
+gauss = st.sidebar.slider("Gaussian blur kernel (odd)", 1, 11, 5, 2)
+min_area = st.sidebar.slider("Min component area (px)", 50, 5000, 700, 50)
+min_skel_len = st.sidebar.slider("Min skeleton length (px)", 10, 300, 80, 5)
+min_elongation = st.sidebar.slider("Min elongation ratio", 1.0, 10.0, 3.5, 0.1)
+spur_iters = st.sidebar.slider("Prune spur iterations", 0, 30, 10, 1)
+closing_k = st.sidebar.slider("Closing kernel", 1, 11, 5, 2)
+opening_k = st.sidebar.slider("Opening kernel", 0, 11, 3, 1)
 
-st.write("### 1) Görsel yükle")
-img_file = st.file_uploader("Görsel dosyası yükleyin (JPG/PNG).", type=["jpg","jpeg","png"])
+uploaded = st.file_uploader("Upload an image (jpg/png)", type=["jpg","jpeg","png"])
 
-st.write("### 2) Model (isteğe bağlı) yükle")
-model_file = st.file_uploader("Model dosyası yükleyin (.pth veya .onnx). Seçili moda uygun olmalı.", type=["pth","onnx"])
+def classical_detector(img_pil):
+    img = np.array(img_pil.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(gray)
+    g = cv2.GaussianBlur(g, (3,3), 0)
+    edges = cv2.Canny(g, 50, 150)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    edges = cv2.dilate(edges, k, iterations=1)
+    prob = edges.astype("float32")/255.0
+    prob = cv2.GaussianBlur(prob, (5,5), 1.0)
+    return prob
 
-col1, col2 = st.columns([1,1])
+def overlay_mask(img_pil, mask, alpha=0.6, color=(255,0,0)):
+    img = np.array(img_pil.convert("RGB")).astype("uint8")
+    mask3 = np.zeros_like(img)
+    mask_bool = (mask>127)
+    mask3[mask_bool] = color
+    out = img.copy()
+    out = cv2.addWeighted(out, 1.0, mask3, alpha, 0)
+    return Image.fromarray(out)
 
-with col1:
-    st.subheader("Girdi")
-    if img_file:
-        image = read_image_as_rgb(img_file)
-        st.image(image, caption="Yüklenen görüntü", use_column_width=True)
-    else:
-        st.info("Bir görüntü seçin. Eğer seçmezseniz demo için örnek bir taş dokusu kullanılacak.")
-        demo = Image.new("RGB", (512, 512), (210, 210, 210))
-        st.image(demo, caption="Demo görüntü", use_column_width=True)
-        image = demo
-
-run = st.button("▶️ Çalıştır")
-
-with col2:
-    st.subheader("Çıktı")
-
-    if run:
-        if mode == "Baseline (Canny)":
-            mask, vis = canny_baseline(np.array(image))
-            st.write("**Basit Canny tabanlı çatlak çıkarımı**")
-            st.image(vis, caption="Canny + morfoloji sonucu", use_column_width=True)
-
-        elif mode == "PyTorch: Sınıflandırma":
-            # Basit CNN ve .pth state_dict
-            model = SimpleCrackClassifier(num_classes=2)
-            if model_file and model_file.name.endswith(".pth"):
-                loaded = safe_torch_load_state_dict(model, model_file)
-                if not loaded:
-                    st.warning("Model state_dict yüklenemedi. Random ağırlıklarla devam ediliyor.")
-            else:
-                st.info(".pth dosyası yüklemediğiniz için model rastgele ağırlıklarla çalışacak (sadece demo).")
-
-            model.eval()
-            x = preprocess_for_classification(image)  # (1,3,H,W) tensor
-            with torch.no_grad():
-                logits = model(x)
-                probs = torch.softmax(logits, dim=1).cpu().numpy().squeeze()
-            pred = int(probs.argmax())
-            labels = ["No Crack", "Crack"]
-            st.metric("Tahmin", labels[pred], delta=f"{probs[pred]*100:.1f}% güven")
-
-        elif mode == "PyTorch: Segmentasyon":
-            net = UNetLite(in_ch=3, out_ch=1)
-            if model_file and model_file.name.endswith(".pth"):
-                loaded = safe_torch_load_state_dict(net, model_file)
-                if not loaded:
-                    st.warning("UNet state_dict yüklenemedi. Random ağırlıklarla devam ediliyor (sadece demo).")
-            else:
-                st.info(".pth dosyası yüklenmedi; ağ rastgele ağırlıklarla (sadece demo).")
-
-            net.eval()
-            x, orig = preprocess_for_segmentation(image) # torch tensor, original np
-            with torch.no_grad():
-                pred = net(x)  # (1,1,h,w)
-                prob = torch.sigmoid(pred).cpu().numpy()[0,0]
-            mask = (prob >= conf_threshold).astype(np.uint8)*255
-            if show_heatmap:
-                heat = (prob * 255).astype(np.uint8)
-                st.image(heat, caption="Olasılık haritası (0-255)", use_column_width=True)
-            if show_overlay:
-                over = overlay_mask(orig, mask)
-                st.image(over, caption="Mask Overlay", use_column_width=True)
-            else:
-                st.image(mask, caption="İkili Maske", use_column_width=True)
-
-        elif mode == "ONNX: Sınıflandırma":
-            if not (model_file and model_file.name.endswith(".onnx")):
-                st.error("Lütfen ONNX sınıflandırma modeli yükleyin (.onnx).")
-            else:
-                ort_sess = ort.InferenceSession(model_file.getvalue(), providers=['CPUExecutionProvider'])
-                x = preprocess_for_classification(image, as_numpy=True)  # np array (1,3,H,W)
-                inp = ort_sess.get_inputs()[0].name
-                out = ort_sess.get_outputs()[0].name
-                logits = ort_sess.run([out], {inp: x})[0]  # (1,2)
-                probs = (logits - logits.max()).astype(np.float32)
-                probs = np.exp(probs) / np.exp(probs).sum(axis=1, keepdims=True)
-                pred = int(probs.argmax())
-                labels = ["No Crack", "Crack"]
-                st.metric("Tahmin", labels[pred], delta=f"{probs[0,pred]*100:.1f}% güven")
-
-        elif mode == "ONNX: Segmentasyon":
-            if not (model_file and model_file.name.endswith(".onnx")):
-                st.error("Lütfen ONNX segmentasyon modeli yükleyin (.onnx).")
-            else:
-                ort_sess = ort.InferenceSession(model_file.getvalue(), providers=['CPUExecutionProvider'])
-                x, orig = preprocess_for_segmentation(image, as_numpy=True)  # np (1,3,h,w), orig np
-                inp = ort_sess.get_inputs()[0].name
-                out = ort_sess.get_outputs()[0].name
-                logits = ort_sess.run([out], {inp: x})[0]  # (1,1,h,w)
-                prob = 1/(1+np.exp(-logits[0,0]))
-                mask = (prob >= conf_threshold).astype(np.uint8)*255
-                if show_heatmap:
-                    heat = (prob * 255).astype(np.uint8)
-                    st.image(heat, caption="Olasılık haritası (0-255)", use_column_width=True)
-                if show_overlay:
-                    over = overlay_mask(orig, mask)
-                    st.image(over, caption="Mask Overlay", use_column_width=True)
-                else:
-                    st.image(mask, caption="İkili Maske", use_column_width=True)
-
-    else:
-        st.info("Sol taraftan modu seçin, görüntünüzü ve (varsa) model dosyanızı yükleyin, sonra **Çalıştır** butonuna basın.")
+if uploaded:
+    img = Image.open(uploaded)
+    st.subheader("Original image")
+    st.image(img, use_column_width=True)
+    with st.spinner("Running classical detector..."):
+        prob_map = classical_detector(img)
+    st.subheader("Probability / edge map (classical detector)")
+    st.image((prob_map*255).astype("uint8"), width=400)
+    st.subheader("Applying improved post-processing...")
+    pp_mask = improved_postprocess_from_probs(prob_map,
+                                             thresh=thresh,
+                                             gaussian_ksize=gauss if gauss%2==1 else gauss+1,
+                                             min_area=min_area,
+                                             min_skel_len=min_skel_len,
+                                             min_elongation=min_elongation,
+                                             spur_prune_iters=spur_iters,
+                                             closing_k=closing_k if closing_k%2==1 else closing_k+1,
+                                             opening_k=opening_k if opening_k%2==1 else opening_k+1)
+    st.write("Post-processed mask (binary)")
+    st.image(pp_mask, width=400)
+    st.write("Overlayed result")
+    st.image(overlay_mask(img, pp_mask), use_column_width=True)
+    st.success("Done — tweak the sliders to reduce false positives or false negatives.")
+else:
+    st.info("Upload an image to run detection. Use the sidebar sliders to tune postprocessing thresholds.")
