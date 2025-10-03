@@ -3,36 +3,37 @@ import streamlit as st
 from PIL import Image
 import numpy as np
 import cv2
-from postprocess_improved import improved_postprocess_from_probs
+from postprocess import postprocess_mask_from_probs
 
-st.set_page_config(page_title="Crack Analyzer (postprocess adjustable)", layout="wide")
+st.set_page_config(page_title="Crack Analyzer (with postprocessing)", layout="wide")
 
-st.title("Crack Analyzer — Demo (improved postprocessing)")
-st.markdown("Upload an image. The app runs a classical edge-based detector and then applies an improved postprocessing chain. Use the sidebar to tune sensitivity.")
+st.title("Crack Analyzer — Demo (postprocessing enabled)")
 
-# Sidebar sliders for live parameter tuning
-st.sidebar.header("Postprocess parameters (tweak & test)")
-thresh = st.sidebar.slider("Probability threshold", 0.5, 0.95, 0.70, 0.01)
-gauss = st.sidebar.slider("Gaussian blur kernel (odd)", 1, 11, 5, 2)
-min_area = st.sidebar.slider("Min component area (px)", 50, 5000, 700, 50)
-min_skel_len = st.sidebar.slider("Min skeleton length (px)", 10, 300, 80, 5)
-min_elongation = st.sidebar.slider("Min elongation ratio", 1.0, 10.0, 3.5, 0.1)
-spur_iters = st.sidebar.slider("Prune spur iterations", 0, 30, 10, 1)
-closing_k = st.sidebar.slider("Closing kernel", 1, 11, 5, 2)
-opening_k = st.sidebar.slider("Opening kernel", 0, 11, 3, 1)
+st.markdown("""
+This demo applies a classical crack-proposal detector (Canny-based) and then a post-processing step
+to remove tiny/noisy detections. If you have a custom segmentation model file named `best_resnet18.pth`
+in the repo, the app can be extended to load it (not included by default).
+""")
 
 uploaded = st.file_uploader("Upload an image (jpg/png)", type=["jpg","jpeg","png"])
 
 def classical_detector(img_pil):
+    # returns probability-like map (float 0..1)
     img = np.array(img_pil.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    # CLAHE to normalize illumination
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     g = clahe.apply(gray)
+    # slight blur
     g = cv2.GaussianBlur(g, (3,3), 0)
+    # Canny edges
     edges = cv2.Canny(g, 50, 150)
+    # Dilate to make edges thicker
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
     edges = cv2.dilate(edges, k, iterations=1)
+    # Normalize to 0..1 float map
     prob = edges.astype("float32")/255.0
+    # Smooth a bit
     prob = cv2.GaussianBlur(prob, (5,5), 1.0)
     return prob
 
@@ -47,26 +48,19 @@ def overlay_mask(img_pil, mask, alpha=0.6, color=(255,0,0)):
 
 if uploaded:
     img = Image.open(uploaded)
-    st.subheader("Original image")
-    st.image(img, use_column_width=True)
+    st.image(img, caption="Uploaded image", use_column_width=True)
     with st.spinner("Running classical detector..."):
         prob_map = classical_detector(img)
-    st.subheader("Probability / edge map (classical detector)")
-    st.image((prob_map*255).astype("uint8"), width=400)
-    st.subheader("Applying improved post-processing...")
-    pp_mask = improved_postprocess_from_probs(prob_map,
-                                             thresh=thresh,
-                                             gaussian_ksize=gauss if gauss%2==1 else gauss+1,
-                                             min_area=min_area,
-                                             min_skel_len=min_skel_len,
-                                             min_elongation=min_elongation,
-                                             spur_prune_iters=spur_iters,
-                                             closing_k=closing_k if closing_k%2==1 else closing_k+1,
-                                             opening_k=opening_k if opening_k%2==1 else opening_k+1)
+    st.write("Probability / edge map (classical detector)")
+    # show prob map
+    st.image((prob_map*255).astype("uint8"), width=350)
+    st.write("Applying post-processing to remove small/noisy detections...")
+    # postprocess
+    pp_mask = postprocess_mask_from_probs(prob_map, thresh=0.65, gaussian_ksize=5, min_area=500, min_len=40, min_w=3)
     st.write("Post-processed mask (binary)")
-    st.image(pp_mask, width=400)
+    st.image(pp_mask, width=350)
     st.write("Overlayed result")
     st.image(overlay_mask(img, pp_mask), use_column_width=True)
-    st.success("Done — tweak the sliders to reduce false positives or false negatives.")
+    st.success("Done — tweak parameters in postprocess.py if you want different sensitivity.")
 else:
-    st.info("Upload an image to run detection. Use the sidebar sliders to tune postprocessing thresholds.")
+    st.info("Upload an image to run detection.")

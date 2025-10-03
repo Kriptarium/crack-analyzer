@@ -1,15 +1,32 @@
 
-Updated Crack Analyzer repository (improved postprocessing)
+# Crack Analyzer (Streamlit demo with post-processing)
 
-Files:
-- app.py : Streamlit app (with sidebar sliders to tune postprocessing)
-- postprocess_improved.py : improved postprocessing functions (skeleton prune, elongation filter, length filter)
-- postprocess.py : compatibility shim
-- requirements.txt : minimal requirements
+This repository contains a minimal Streamlit demo app that runs a classical crack-proposal detector
+(Canny-based) and then applies post-processing to remove small/noisy detections.
 
-How to use:
-1. Download/unzip the files and upload them to your GitHub repo (either replace existing files or add new ones).
-2. Push to GitHub; Render will auto-deploy.
-3. On the live app, use the sidebar sliders to tune threshold, area, skeleton length, etc. to reduce false positives.
+It is intended to be uploaded to your GitHub repo (or replace files) and then deployed to Render (or run locally).
 
-Note: This demo uses a classical edge detector (Canny) as the "probability" source. If you later want to load your segmentation model weights, do not upload the .pth to GitHub; instead use a MODEL_URL environment variable and modify the start command to download the model on deploy.
+## Files
+- `app.py` - Streamlit app. Upload an image, runs detection + postprocess, shows overlay.
+- `postprocess.py` - Post-processing utilities (component filtering, skeleton-based filtering).
+- `requirements.txt` - Minimal requirements for Render.
+- `.gitignore` - Ignore large files / model weights.
+
+## How to deploy (GitHub -> Render)
+1. Upload these files to your GitHub repository (e.g. via the web interface: "Add file" -> "Upload files"), commit to `main`.
+2. On Render: Create a new **Web Service**, connect GitHub, choose this repo.
+   - Build command: `pip install -r requirements.txt`
+   - Start command:
+     ```
+     streamlit run app.py --server.port $PORT --server.headless true
+     ```
+3. Render will build and deploy. Check logs if there are errors.
+
+## Notes
+- This demo **does not** include a trained deep learning segmentation model. If you want to use a model (e.g. `best_resnet18.pth`), do **not** upload it to GitHub; instead store it externally and modify `app.py` to load it (I can help).
+- The post-processing step is the main improvement: it reduces false positives from small texture details.
+
+If you want, I can:
+- Zip these files so you can upload them through GitHub web UI.
+- Or push them directly to your repo if you grant steps (I will instead provide instructions).
+
